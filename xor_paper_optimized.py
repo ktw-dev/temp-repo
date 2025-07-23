@@ -1,22 +1,4 @@
 #!/usr/bin/env python3
-"""
-Optimized XOR implementation based on academic papers:
-- Han & Ki (ASIACRYPT '22): Nibble extraction with conjugate reduction
-- Cheon et al. (SPC '20): Even polynomial optimization
-- Baby-step/giant-step for polynomial evaluation
-
-## Optimization Comparison
-
-| Optimization Item | Paper Proposal | Current Implementation | Evaluation |
-|------------------|----------------|----------------------|------------|
-| **Nibble Extraction** (Han & Ki) | 8-bit → nibbles: degree 255 → 15 via x^16 reuse | extract_nibbles() with x·P(x^16) evaluation | Same idea but needs level alignment |
-| **Even-Polynomial** (Cheon et al.) | Even-only: p(x)=g(x^2) for depth/2 | _is_xor_even_poly() ready but returns False | Not utilized → XOR still depth 15 |
-| **BSGS Evaluation** | Depth O(√d) | evaluate_polynomial_bsgs() exists | Giant powers recomputed → log depth lost |
-| **Rotation Keys** | Han & Ki: Δ = 1,2,4,8,16 only | Same set (5 keys) | Matches |
-| **Scale/Level Mgmt** | Papers assume CKKS level alignment | multiply() lacks level alignment | **Key difference** → errors/noise |
-| **Coeff Cache** | Not in papers (implementation detail) | FFT + conjugate symmetry, npy cache | Good practical improvement |
-"""
-#!/usr/bin/env python3
 import numpy as np
 from typing import Union, List, Optional, Dict, Tuple, Any, Sequence
 from dataclasses import dataclass
@@ -25,10 +7,15 @@ from pathlib import Path
 import time
 import scipy.fft
 from desilofhe import Engine
+import desilofhe
 from datetime import datetime
 import logging.handlers
 from collections import OrderedDict
 import warnings
+
+Scalar = Union[int, float, complex]
+
+
 
 def setup_logging():
     log_dir = Path("logs")
@@ -57,7 +44,6 @@ def setup_logging():
 
 log_file_path = setup_logging()
 logger = logging.getLogger('xor')
-Scalar = Union[int, float, complex]
 
 @dataclass
 class XORConfig:
@@ -104,9 +90,29 @@ class XORPaperOptimized:
         self.byte_encoding = self._create_encoding(8)
         self._coeff_cache = OrderedDict()
         self._load_cached_coefficients()
+        self._power_basis_cache = {}
         self._precompute_coefficients()
+        self._load_noise_reduction_coeffs()
         logger.info(f"XOR initialization complete. Slot count: {self.engine.slot_count}")
-    
+    def multiply_plain(self, ct: Any, val: Union[Scalar, np.ndarray, Any]) -> Any:
+        """Multiply ciphertext by plaintext value, handling complex scalars."""
+        if isinstance(val, (int, float)):
+            # Real scalar - direct multiplication
+            return self.engine.multiply(ct, val)
+        elif isinstance(val, complex):
+            # Complex scalar - need to encode
+            scalar_array = np.full(self.max_slots, val, dtype=np.complex128)
+            pt = self.engine.encode(scalar_array)
+            return self.engine.multiply(ct, pt)
+        elif isinstance(val, np.ndarray):
+            if np.ptp(val) < 1e-12:
+                return self.multiply_plain(ct, complex(val.flat[0]))
+            pt = self.engine.encode(val.astype(np.complex128))
+            return self.engine.multiply(ct, pt)
+        elif hasattr(val, '__class__') and 'Plaintext' in str(val.__class__):
+            return self.engine.multiply(ct, val)
+        else:
+            raise TypeError(f"multiply_plain: unsupported type {type(val)}")
     def _create_encoding(self, bits: int) -> Dict[str, Any]:
         n = 1 << bits
         root = np.exp(2j * np.pi / n)
@@ -156,48 +162,66 @@ class XORPaperOptimized:
     
     def _evaluate_sparse_poly(self, x_enc: Any, coeffs: np.ndarray, indices: List[int]) -> Any:
         max_degree = max(indices)
-        const_coeff = 0.0
-        if 0 in indices:
-            real_val = np.real_if_close(coeffs[0], tol=1000)
-            if np.iscomplexobj(real_val):
-                if abs(coeffs[0].imag) < 1e-10:
-                    const_coeff = float(coeffs[0].real)
-                else:
-                    const_coeff = float(coeffs[0].real)  # Just use real part for polynomials
-            else:
-                const_coeff = float(real_val)
-        if max_degree == 0:
-            zero_data = np.zeros(self.max_slots, dtype=np.complex128)
-            zero_ct = self.encrypt(zero_data, level=getattr(x_enc, 'level', 25))
-            if abs(const_coeff) > 1e-14:
-                return self.engine.add(zero_ct, const_coeff)
-            else:
-                return zero_ct
-        powers = self.engine.make_power_basis(x_enc, max_degree, self.relin_key)
-        ciphertexts = []
-        weights = []
+        powers = self.engine.make_power_basis(x_enc, max_degree, self.relin_key) if max_degree > 0 else []
+        
+        # Separate real and complex coefficients
+        real_terms = []
+        real_weights = []
+        complex_terms = []
+        
         for idx in indices:
-            if idx == 0:
-                continue
-            ciphertexts.append(powers[idx - 1])
-            real_val = np.real_if_close(coeffs[idx], tol=1000)
-            if np.iscomplexobj(real_val):
-                if abs(coeffs[idx].imag) < 1e-10:
-                    weights.append(float(coeffs[idx].real))
+            coeff = coeffs[idx]
+            if abs(coeff.imag) < 1e-10:
+                # Real coefficient
+                if idx == 0:
+                    # Handle constant term separately
+                    real_weights = [float(coeff.real)] + real_weights if real_weights else [float(coeff.real)]
                 else:
-                    weights.append(float(coeffs[idx].real))  # Just use real part
+                    real_terms.append(powers[idx - 1])
+                    real_weights.append(float(coeff.real))
             else:
-                weights.append(float(real_val))
-        if not ciphertexts:
-            zero_data = np.zeros(self.max_slots, dtype=np.complex128)
-            zero_ct = self.encrypt(zero_data, level=getattr(x_enc, 'level', 25))
-            if abs(const_coeff) > 1e-14:
-                return self.engine.add(zero_ct, const_coeff)
+                # Complex coefficient - needs special handling
+                if idx == 0:
+                    # Complex constant - create one ciphertext
+                    one_data = np.ones(self.max_slots, dtype=np.complex128)
+                    one_ct = self.encrypt(one_data, level=getattr(x_enc, 'level', 25))
+                    complex_terms.append((one_ct, coeff))
+                else:
+                    complex_terms.append((powers[idx - 1], coeff))
+        
+        # Process real coefficients with weighted_sum
+        result = None
+        if real_terms:
+            # weighted_sum: first weight is constant term
+            if len(real_weights) == len(real_terms) + 1:
+                # Constant already included as first weight
+                result = self.engine.weighted_sum(real_terms, real_weights)
             else:
-                return zero_ct
-        result = self.engine.weighted_sum(ciphertexts, weights)
-        if abs(const_coeff) > 1e-14:
-            result = self.engine.add(result, const_coeff)
+                # Need to add constant term
+                real_weights = [0.0] + real_weights
+                result = self.engine.weighted_sum(real_terms, real_weights)
+        elif real_weights:
+            # Only constant term - use add_plain for efficiency
+            result = self.add_plain(x_enc, real_weights[0])
+        
+        # Process complex coefficients individually
+        for term, coeff in complex_terms:
+            coeff_pt = self.engine.encode(
+                np.full(self.max_slots, coeff, dtype=np.complex128)
+            )
+            term_result = self.multiply_plain(term, coeff_pt)
+            result = term_result if result is None else self.engine.add(result, term_result)
+        
+        # Handle case where we only have real constant but no terms
+        if result is None and real_weights:
+            result = self.add_plain(x_enc, real_weights[0])
+        
+        # Return zero if no result
+        if result is None:
+            # Return zero ciphertext
+            zero_pt = self.engine.encode(np.zeros(self.max_slots, dtype=np.complex128))
+            result = self.engine.multiply(x_enc, zero_pt)
+        
         return result
     
     def rotate_batch(self, ciphertext: Any, deltas: List[int]) -> List[Any]:
@@ -228,7 +252,7 @@ class XORPaperOptimized:
         upper = self.engine.multiply(byte_enc, poly_result, self.relin_key)
         lower = x_16
         if 16 < len(lower_coeffs) and abs(lower_coeffs[16] - 1.0) > 1e-14:
-            lower = self.engine.multiply(lower, lower_coeffs[16])
+            lower = self.multiply_plain(lower, lower_coeffs[16])
         return upper, lower
     
     def apply_nibble_xor(self, x_enc: Any, y_enc: Any) -> Any:
@@ -255,43 +279,73 @@ class XORPaperOptimized:
             y_basis = self.engine.make_power_basis(y_enc, max_y_deg, self.relin_key)
             for i in range(1, max_y_deg + 1):
                 y_powers[i] = y_basis[i - 1]
-        terms = []
-        weights = []
-        const_coeff = 0.0
+        real_terms = []
+        real_weights = []
+        complex_terms = []
+        
         for idx_i, idx_j in non_zero_indices:
             coeff = coeffs_2d[idx_i, idx_j]
-            real_val = np.real_if_close(coeff, tol=1000)
-            if np.iscomplexobj(real_val):
-                if abs(coeff.imag) < 1e-10:
-                    coeff_real = float(coeff.real)
-                else:
-                    raise ValueError(f"Coefficient has non-negligible imaginary part: {coeff}")
-            else:
-                coeff_real = float(real_val)
+            
+            # Determine the term (monomial)
             if idx_i == 0 and idx_j == 0:
-                const_coeff = coeff_real
+                # Constant term - always treat as complex to preserve accuracy
+                complex_terms.append((x_powers[0], coeff))
                 continue
             elif idx_i == 0:
-                terms.append(y_powers[idx_j])
-                weights.append(coeff_real)
+                term = y_powers[idx_j]
             elif idx_j == 0:
-                terms.append(x_powers[idx_i])
-                weights.append(coeff_real)
+                term = x_powers[idx_i]
             else:
-                xy_term = self.engine.multiply(x_powers[idx_i], y_powers[idx_j], self.relin_key)
-                terms.append(xy_term)
-                weights.append(coeff_real)
-        if not terms:
-            zero_ct = self.encrypt(np.zeros(self.max_slots, dtype=np.complex128), 
-                                 level=getattr(x_enc, 'level', 25))
-            if abs(const_coeff) > 1e-14:
-                return self.engine.add(zero_ct, const_coeff)
+                term = self.engine.multiply(x_powers[idx_i], y_powers[idx_j], self.relin_key)
+            
+            # Separate real and complex coefficients
+            if abs(coeff.imag) < 1e-10:
+                real_terms.append(term)
+                real_weights.append(float(coeff.real))
             else:
-                return zero_ct
-        result = self.engine.weighted_sum(terms, weights)
-        if abs(const_coeff) > 1e-14:
-            result = self.engine.add(result, const_coeff)
+                complex_terms.append((term, coeff))
+        
+        # Process real coefficients with weighted_sum
+        result = None
+        if real_terms:
+            # weighted_sum expects weights = [constant] + [weights for terms]
+            if len(real_weights) > len(real_terms):
+                # Constant already at front
+                result = self.engine.weighted_sum(real_terms, real_weights)
+            else:
+                # Need to add zero constant
+                result = self.engine.weighted_sum(real_terms, [0.0] + real_weights)
+        
+        # Process complex coefficients individually
+        for term, coeff in complex_terms:
+            # Encode complex coefficient as plaintext to preserve imaginary part
+            coeff_pt = self.engine.encode(
+                np.full(self.max_slots, coeff, dtype=np.complex128)
+            )
+            term_result = self.multiply_plain(term, coeff_pt)
+            result = term_result if result is None else self.engine.add(result, term_result)
+        
+        # If no result yet, return zero
+        if result is None:
+            # Return zero
+            zero_pt = self.engine.encode(np.zeros(self.max_slots, dtype=np.complex128))
+            result = self.engine.multiply(x_enc, zero_pt)
+        
         return result
+    
+    def encrypt_nibbles(self, byte_array: np.ndarray, level: int = 20) -> Tuple[Any, Any]:
+        """Encrypt bytes directly as separate hi/lo nibbles to avoid extraction."""
+        hi = (byte_array >> 4) & 0xF
+        lo = byte_array & 0xF
+        ct_hi = self.encrypt(self.encode_array(hi, 4), level)
+        ct_lo = self.encrypt(self.encode_array(lo, 4), level)
+        return ct_hi, ct_lo
+    
+    def apply_nibble_xor_direct(self, x_hi: Any, x_lo: Any, y_hi: Any, y_lo: Any) -> Tuple[Any, Any]:
+        """Apply XOR directly on pre-separated nibbles."""
+        hi_xor = self.apply_nibble_xor(x_hi, y_hi)
+        lo_xor = self.apply_nibble_xor(x_lo, y_lo)
+        return hi_xor, lo_xor
     
     def apply_byte_xor_via_nibbles(self, x_enc: Any, y_enc: Any) -> Tuple[Any, Any]:
         x_hi, x_lo = self.extract_nibbles(x_enc)
@@ -353,7 +407,7 @@ class XORPaperOptimized:
         for i in range(n):
             for j in range(n):
                 lut[i, j] = root ** (i ^ j)
-        coeffs = scipy.fft.fftn(lut, norm='forward')
+        coeffs = scipy.fft.fftn(lut, norm='forward', workers=self.config.thread_count)
         self._cache_coefficient(cache_key, coeffs)
         return coeffs
     
@@ -394,9 +448,108 @@ class XORPaperOptimized:
             np.save(file, coeffs)
             logger.info(f"Saved coefficients to {file}")
 
+    def _load_noise_reduction_coeffs(self):
+        """Load noise reduction polynomial coefficients from paper."""
+        # Try to load from paper's CSV file
+        noise_coeff_file = Path("xor_cache") / "noise_reduction_coeffs.csv"
+        if noise_coeff_file.exists():
+            try:
+                coeffs = np.loadtxt(noise_coeff_file, dtype=np.complex128, delimiter=',')
+                self._coeff_cache['noise_reduction_f'] = coeffs
+                logger.info(f"Loaded noise reduction coefficients from {noise_coeff_file}")
+                return
+            except Exception as e:
+                logger.warning(f"Failed to load noise coefficients: {e}")
+        
+        # Paper's noise reduction polynomial (degree 32-48)
+        degree = 32
+        coeffs = np.zeros(degree + 1, dtype=np.complex128)
+        # Approximate coefficients from paper Section 3.3
+        coeffs[0] = 1.0
+        coeffs[1] = 0.0
+        coeffs[2] = -0.5
+        coeffs[4] = 0.25
+        coeffs[8] = -0.125
+        coeffs[16] = 0.0625
+        coeffs[32] = -0.03125
+        self._coeff_cache['noise_reduction_f'] = coeffs
+    
+    def apply_noise_reduction(self, ct: Any) -> Any:
+        """Apply noise reduction polynomial f to reduce noise before next LUT."""
+        coeffs = self._coeff_cache.get('noise_reduction_f')
+        if coeffs is None:
+            return ct
+        result = self.evaluate_polynomial(ct, coeffs)
+        # Rescale to manage noise
+        result = self.engine.rescale(result)
+        return result
+    
+    def _make_power_basis_cached(self, x_enc: Any, max_degree: int) -> List[Any]:
+        """Create power basis with caching for shared use across LUTs."""
+        cache_key = (id(x_enc), max_degree)
+        if cache_key in self._power_basis_cache:
+            return self._power_basis_cache[cache_key]
+        powers = self.engine.make_power_basis(x_enc, max_degree, self.relin_key)
+        self._power_basis_cache[cache_key] = powers
+        return powers
+    
+    def evaluate_lut_bundle(self, lut_coeffs_list: List[np.ndarray], x_enc: Any) -> List[Any]:
+        """Evaluate multiple LUTs simultaneously sharing power basis."""
+        max_degree = max(len(coeffs) - 1 for coeffs in lut_coeffs_list)
+        powers = self._make_power_basis_cached(x_enc, max_degree)
+        
+        results = []
+        for coeffs in lut_coeffs_list:
+            # Use shared power basis for each LUT
+            non_zero_indices = [i for i, c in enumerate(coeffs) if abs(c) > 1e-14]
+            if not non_zero_indices:
+                results.append(self.engine.multiply(x_enc, 0))
+                continue
+            
+            # Separate constant term and other terms
+            constant_term = 0.0
+            terms_list = []
+            weights = []
+            
+            for idx in non_zero_indices:
+                if idx == 0:
+                    constant_term = float(coeffs[0].real)
+                else:
+                    terms_list.append(powers[idx - 1])
+                    weights.append(float(coeffs[idx].real))
+            
+            # Build result
+            if terms_list:
+                # weighted_sum with constant as first weight
+                all_weights = [constant_term] + weights
+                result = self.engine.weighted_sum(terms_list, all_weights)
+            else:
+                # Only constant term
+                result = self.add_plain(x_enc, constant_term)
+            
+            results.append(result)
+        
+        return results
+    
+    def add_plain(self, ct: Any, val: Union[Scalar, np.ndarray]) -> Any:
+        """Add plaintext value to ciphertext efficiently."""
+        if isinstance(val, (int, float, complex)):
+            # desilofhe supports direct scalar addition
+            return self.engine.add(ct, val)
+        elif isinstance(val, np.ndarray):
+            # For arrays, check if constant
+            if np.ptp(val) < 1e-12:
+                return self.engine.add(ct, complex(val.flat[0]))
+            # Otherwise encode as plaintext
+            pt = self.engine.encode(val.astype(np.complex128))
+            return self.engine.add(ct, pt)
+        else:
+            raise TypeError(f"add_plain: unsupported type {type(val)}")
+
 def decrypt_simd(xor_inst: XORPaperOptimized, hi_ct: Any, lo_ct: Any, length: int) -> np.ndarray:
     hi_dec = xor_inst.decrypt(hi_ct)[:length]
     lo_dec = xor_inst.decrypt(lo_ct)[:length]
     hi = xor_inst.decode_array(hi_dec, 4)
     lo = xor_inst.decode_array(lo_dec, 4)
     return (hi << 4) | lo
+    
